@@ -628,7 +628,7 @@ class WhisperModel:
             a path to a converted model directory, or a CTranslate2-converted Whisper model ID from
             the HF Hub. When a size or a model ID is configured, the converted model is downloaded
             from the Hugging Face Hub.
-          device: Device to use for computation ("cpu", "cuda", "auto").
+          device: Device to use for computation ("cpu", "cuda", "mps", "auto").
           device_index: Device ID to use.
             The model can also be loaded on multiple GPUs by passing a list of IDs
             (e.g. [0, 1, 2, 3]). In that case, multiple transcriptions can run in parallel
@@ -672,6 +672,43 @@ class WhisperModel:
                 use_auth_token=use_auth_token,
             )
 
+        # Resolve the device when "auto" is selected.
+        if device == "auto":
+            try:
+                import torch
+
+                if torch.backends.mps.is_available():
+                    device = "mps"
+            except Exception:
+                pass
+
+        if device == "mps":
+            try:
+                import torch
+                import whisper as pt_whisper
+            except Exception as e:
+                raise ImportError(
+                    "Using device 'mps' requires `torch` and `openai-whisper` to be installed"
+                ) from e
+            if not torch.backends.mps.is_available():
+                raise RuntimeError("MPS backend is not available on this system.")
+
+            self.torch_model = pt_whisper.load_model(model_size_or_path, device="mps")
+            self.model = None
+            self.device = "mps"
+            self.device_index = [0]
+            self._is_multilingual = self.torch_model.is_multilingual
+            self.hf_tokenizer = self.torch_model.tokenizer
+            self.feat_kwargs = {}
+            self.feature_extractor = None
+            self.input_stride = 2
+            self.num_samples_per_token = 320
+            self.frames_per_second = 50
+            self.tokens_per_second = 2
+            self.time_precision = 0.02
+            self.max_length = 448
+            return
+
         self.model = ctranslate2.models.Whisper(
             model_path,
             device=device,
@@ -690,7 +727,7 @@ class WhisperModel:
             self.hf_tokenizer = tokenizers.Tokenizer.from_file(tokenizer_file)
         else:
             self.hf_tokenizer = tokenizers.Tokenizer.from_pretrained(
-                "openai/whisper-tiny" + ("" if self.model.is_multilingual else ".en")
+                "openai/whisper-tiny" + ("" if self._is_multilingual else ".en")
             )
         self.feat_kwargs = self._get_feature_kwargs(model_path, preprocessor_bytes)
         self.feature_extractor = FeatureExtractor(**self.feat_kwargs)
@@ -706,11 +743,12 @@ class WhisperModel:
         )
         self.time_precision = 0.02
         self.max_length = 448
+        self._is_multilingual = self.model.is_multilingual
 
     @property
     def supported_languages(self) -> List[str]:
         """The languages supported by the model."""
-        return list(_LANGUAGE_CODES) if self.model.is_multilingual else ["en"]
+        return list(_LANGUAGE_CODES) if self._is_multilingual else ["en"]
 
     def _get_feature_kwargs(self, model_path, preprocessor_bytes=None) -> dict:
         config = {}
@@ -849,6 +887,45 @@ class WhisperModel:
             - a generator over transcribed segments
             - an instance of TranscriptionInfo
         """
+        if getattr(self, "device", None) == "mps":
+            return self._transcribe_with_mps(
+                audio,
+                language=language,
+                task=task,
+                log_progress=log_progress,
+                beam_size=beam_size,
+                best_of=best_of,
+                patience=patience,
+                length_penalty=length_penalty,
+                repetition_penalty=repetition_penalty,
+                no_repeat_ngram_size=no_repeat_ngram_size,
+                temperature=temperature,
+                compression_ratio_threshold=compression_ratio_threshold,
+                log_prob_threshold=log_prob_threshold,
+                no_speech_threshold=no_speech_threshold,
+                condition_on_previous_text=condition_on_previous_text,
+                prompt_reset_on_temperature=prompt_reset_on_temperature,
+                initial_prompt=initial_prompt,
+                prefix=prefix,
+                suppress_blank=suppress_blank,
+                suppress_tokens=suppress_tokens,
+                without_timestamps=without_timestamps,
+                max_initial_timestamp=max_initial_timestamp,
+                word_timestamps=word_timestamps,
+                prepend_punctuations=prepend_punctuations,
+                append_punctuations=append_punctuations,
+                multilingual=multilingual,
+                vad_filter=vad_filter,
+                vad_parameters=vad_parameters,
+                max_new_tokens=max_new_tokens,
+                chunk_length=chunk_length,
+                clip_timestamps=clip_timestamps,
+                hallucination_silence_threshold=hallucination_silence_threshold,
+                hotwords=hotwords,
+                language_detection_threshold=language_detection_threshold,
+                language_detection_segments=language_detection_segments,
+            )
+
         sampling_rate = self.feature_extractor.sampling_rate
 
         if multilingual and not self.model.is_multilingual:
@@ -1368,11 +1445,152 @@ class WhisperModel:
 
                 prompt_reset_since = len(all_tokens)
 
-            pbar.update(
-                (min(content_frames, seek) - previous_seek)
-                * self.feature_extractor.time_per_frame,
+                pbar.update(
+                    (min(content_frames, seek) - previous_seek)
+                    * self.feature_extractor.time_per_frame,
+                )
+            pbar.close()
+
+    def _transcribe_with_mps(
+        self,
+        audio: Union[str, BinaryIO, np.ndarray],
+        language: Optional[str] = None,
+        task: str = "transcribe",
+        log_progress: bool = False,
+        beam_size: int = 5,
+        best_of: int = 5,
+        patience: float = 1,
+        length_penalty: float = 1,
+        repetition_penalty: float = 1,
+        no_repeat_ngram_size: int = 0,
+        temperature: Union[float, List[float], Tuple[float, ...]] = 0.0,
+        compression_ratio_threshold: Optional[float] = 2.4,
+        log_prob_threshold: Optional[float] = -1.0,
+        no_speech_threshold: Optional[float] = 0.6,
+        condition_on_previous_text: bool = True,
+        prompt_reset_on_temperature: float = 0.5,
+        initial_prompt: Optional[Union[str, Iterable[int]]] = None,
+        prefix: Optional[str] = None,
+        suppress_blank: bool = True,
+        suppress_tokens: Optional[List[int]] = None,
+        without_timestamps: bool = False,
+        max_initial_timestamp: float = 1.0,
+        word_timestamps: bool = False,
+        prepend_punctuations: str = "\"'“¿([{-",
+        append_punctuations: str = "\"'.。,，!！?？:：”)]}、",
+        multilingual: bool = False,
+        vad_filter: bool = False,
+        vad_parameters: Optional[Union[dict, VadOptions]] = None,
+        max_new_tokens: Optional[int] = None,
+        chunk_length: Optional[int] = None,
+        clip_timestamps: Union[str, List[float]] = "0",
+        hallucination_silence_threshold: Optional[float] = None,
+        hotwords: Optional[str] = None,
+        language_detection_threshold: Optional[float] = 0.5,
+        language_detection_segments: int = 1,
+    ) -> Tuple[Iterable[Segment], TranscriptionInfo]:
+        if suppress_tokens is None:
+            suppress_tokens = []
+        if not isinstance(audio, np.ndarray):
+            audio = decode_audio(audio)
+        sampling_rate = 16000
+        duration = audio.shape[0] / sampling_rate
+
+        temp = temperature[0] if isinstance(temperature, (list, tuple)) else temperature
+        result = self.torch_model.transcribe(
+            audio,
+            language=language,
+            task=task,
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            temperature=temp,
+            initial_prompt=initial_prompt,
+            prefix=prefix,
+            suppress_blank=suppress_blank,
+            suppress_tokens=suppress_tokens,
+            without_timestamps=without_timestamps,
+            word_timestamps=word_timestamps,
+        )
+
+        segments = []
+        for seg in result.get("segments", []):
+            words = None
+            if seg.get("words"):
+                words = [
+                    Word(
+                        start=w.get("start", 0.0),
+                        end=w.get("end", 0.0),
+                        word=w.get("word", ""),
+                        probability=w.get("probability", 0.0),
+                    )
+                    for w in seg["words"]
+                ]
+            segments.append(
+                Segment(
+                    id=seg.get("id", 0),
+                    seek=seg.get("seek", 0),
+                    start=seg.get("start", 0.0),
+                    end=seg.get("end", 0.0),
+                    text=seg.get("text", ""),
+                    tokens=seg.get("tokens", []),
+                    avg_logprob=seg.get("avg_logprob", 0.0),
+                    compression_ratio=seg.get("compression_ratio", 0.0),
+                    no_speech_prob=seg.get("no_speech_prob", 0.0),
+                    words=words,
+                    temperature=seg.get("temperature"),
+                )
             )
-        pbar.close()
+
+        transcription_options = TranscriptionOptions(
+            beam_size=beam_size,
+            best_of=best_of,
+            patience=patience,
+            length_penalty=length_penalty,
+            repetition_penalty=repetition_penalty,
+            no_repeat_ngram_size=no_repeat_ngram_size,
+            log_prob_threshold=log_prob_threshold,
+            no_speech_threshold=no_speech_threshold,
+            compression_ratio_threshold=compression_ratio_threshold,
+            condition_on_previous_text=condition_on_previous_text,
+            prompt_reset_on_temperature=prompt_reset_on_temperature,
+            temperatures=
+                list(temperature)
+                if isinstance(temperature, (list, tuple))
+                else [temperature],
+            initial_prompt=initial_prompt,
+            prefix=prefix,
+            suppress_blank=suppress_blank,
+            suppress_tokens=suppress_tokens,
+            without_timestamps=without_timestamps,
+            max_initial_timestamp=max_initial_timestamp,
+            word_timestamps=word_timestamps,
+            prepend_punctuations=prepend_punctuations,
+            append_punctuations=append_punctuations,
+            multilingual=multilingual,
+            max_new_tokens=max_new_tokens,
+            clip_timestamps=clip_timestamps,
+            hallucination_silence_threshold=hallucination_silence_threshold,
+            hotwords=hotwords,
+        )
+
+        if isinstance(vad_parameters, VadOptions):
+            vad_options = vad_parameters
+        else:
+            vad_options = VadOptions(**(vad_parameters or {}))
+
+        info = TranscriptionInfo(
+            language=result.get("language", language or ""),
+            language_probability=result.get("language_probability", 0.0),
+            duration=duration,
+            duration_after_vad=duration,
+            all_language_probs=result.get("all_language_probs"),
+            transcription_options=transcription_options,
+            vad_options=vad_options,
+        )
+
+        return segments, info
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
